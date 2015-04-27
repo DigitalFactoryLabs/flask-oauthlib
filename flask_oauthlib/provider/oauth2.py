@@ -17,7 +17,7 @@ from flask import redirect, abort
 from werkzeug import cached_property
 from werkzeug.utils import import_string
 from oauthlib import oauth2
-from oauthlib.oauth2 import RequestValidator, Server
+from oauthlib.oauth2 import RequestValidator, Server, BackendApplicationServer
 from oauthlib.common import to_unicode
 from ..utils import extract_params, decode_base64, create_response
 
@@ -171,6 +171,61 @@ class OAuth2Provider(object):
                 refresh_token_generator=refresh_token_generator,
             )
         raise RuntimeError('application not bound to required getters')
+
+    @cached_property
+    def backendserver(self):
+        """
+        client creds ...
+        """
+        expires_in = self.app.config.get('OAUTH2_PROVIDER_TOKEN_EXPIRES_IN')
+        token_generator = self.app.config.get(
+            'OAUTH2_PROVIDER_TOKEN_GENERATOR', None
+        )
+        if token_generator and not callable(token_generator):
+            token_generator = import_string(token_generator)
+
+        refresh_token_generator = self.app.config.get(
+            'OAUTH2_PROVIDER_REFRESH_TOKEN_GENERATOR', None
+        )
+        if refresh_token_generator and not callable(refresh_token_generator):
+            refresh_token_generator = import_string(refresh_token_generator)
+
+        if hasattr(self, '_validator'):
+            print 'Is this validator check executed?'
+            return BackendApplicationServer(
+                self._validator,
+                token_expires_in=expires_in,
+                token_generator=token_generator,
+                refresh_token_generator=refresh_token_generator,
+            )
+
+        if hasattr(self, '_clientgetter') and \
+           hasattr(self, '_tokengetter') and \
+           hasattr(self, '_tokensetter') and \
+           hasattr(self, '_grantgetter') and \
+           hasattr(self, '_grantsetter'):
+
+            usergetter = None
+            if hasattr(self, '_usergetter'):
+                usergetter = self._usergetter
+
+            validator = OAuth2RequestValidator(
+                clientgetter=self._clientgetter,
+                tokengetter=self._tokengetter,
+                grantgetter=self._grantgetter,
+                usergetter=usergetter,
+                tokensetter=self._tokensetter,
+                grantsetter=self._grantsetter,
+            )
+            self._validator = validator
+            return BackendApplicationServer(
+                validator,
+                token_expires_in=expires_in,
+                token_generator=token_generator,
+                refresh_token_generator=refresh_token_generator,
+            )
+        raise RuntimeError('application not bound to required getters')
+
 
     def before_request(self, f):
         """Register functions to be invoked before accessing the resource.
@@ -356,6 +411,59 @@ class OAuth2Provider(object):
         self._grantsetter = f
         return f
 
+    def client_credentials_handler(self, f):
+        """Register a function to handle parsing the client credentials grant flow.
+        """
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            # raise if server not implemented
+            #server = self.server
+            server = self.backendserver
+            uri, http_method, body, headers = extract_params()
+
+            if request.method in ('GET', 'HEAD'):
+                try:
+                    #ret = server.validate_authorization_request(
+                    #    uri, http_method, body, headers
+                    #)
+                    ret = server.create_token_response(uri, http_method, body, headers)
+                    scopes, credentials = ret
+                    kwargs['scopes'] = scopes
+                    kwargs.update(credentials)
+                except oauth2.FatalClientError as e:
+                    log.debug('Fatal client error %r', e)
+                    return redirect(e.in_uri(self.error_uri))
+                except oauth2.OAuth2Error as e:
+                    log.debug('OAuth2Error: %r', e)
+                    return redirect(e.in_uri(redirect_uri))
+
+            else:
+                redirect_uri = request.values.get(
+                    'redirect_uri', self.error_uri
+                )
+
+            try:
+                rv = f(*args, **kwargs)
+            except oauth2.FatalClientError as e:
+                log.debug('Fatal client error %r', e)
+                return redirect(e.in_uri(self.error_uri))
+            except oauth2.OAuth2Error as e:
+                log.debug('OAuth2Error: %r', e)
+                return redirect(e.in_uri(redirect_uri))
+
+            if not isinstance(rv, bool):
+                # if is a response or redirect
+                return rv
+
+            if not rv:
+                # denied by user
+                e = oauth2.AccessDeniedError()
+                return redirect(e.in_uri(redirect_uri))
+            return self.confirm_authorization_request()
+        return decorated
+
+        
+
     def authorize_handler(self, f):
         """Authorization handler decorator.
 
@@ -491,6 +599,32 @@ class OAuth2Provider(object):
             return create_response(*ret)
         return decorated
 
+    def cc_token_handler(self, f):
+        """Access/refresh token handler decorator.
+
+        The decorated function should return an dictionary or None as
+        the extra credentials for creating the token response.
+
+        You can control the access method with standard flask route mechanism.
+        If you only allow the `POST` method::
+
+            @app.route('/oauth/token', methods=['POST'])
+            @oauth.token_handler
+            def access_token():
+                return None
+        """
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            server = self.backendserver
+            uri, http_method, body, headers = extract_params()
+            credentials = f(*args, **kwargs) or {}
+            log.debug('Fetched extra credentials, %r.', credentials)
+            ret = server.create_token_response(
+                uri, http_method, body, headers, credentials
+            )
+            return create_response(*ret)
+        return decorated
+
     def revoke_handler(self, f):
         """Access/refresh token revoke decorator.
 
@@ -581,7 +715,7 @@ class OAuth2RequestValidator(RequestValidator):
         .. _`Section 4.1.3`: http://tools.ietf.org/html/rfc6749#section-4.1.3
         .. _`Section 6`: http://tools.ietf.org/html/rfc6749#section-6
         """
-        grant_types = ('password', 'authorization_code', 'refresh_token')
+        grant_types = ('password', 'authorization_code', 'refresh_token', 'client_credentials')
         return request.grant_type in grant_types
 
     def authenticate_client(self, request, *args, **kwargs):
@@ -589,6 +723,7 @@ class OAuth2RequestValidator(RequestValidator):
         log.debug('Authenticate client %r', auth)
         if auth:
             try:
+                #Looks for client credentials as aBase64EncodeFunction(clientidvalue:clientsecret).
                 _, s = auth.split(' ')
                 client_id, client_secret = decode_base64(s).split(':')
                 client_id = to_unicode(client_id, 'utf-8')
